@@ -377,7 +377,7 @@ h2.section-label{font-family:var(--sans);font-size:12px;text-transform:uppercase
         </div>
       </div>
 
-      <div class="rail-note">Shipped orders with no photo on file are removed automatically one week after their ship date.</div>
+      <div class="rail-note">Orders missing from the backlog for 7 days are treated as shipped. Shipped orders with no photo are removed a week after that.</div>
     </aside>
 
     <section class="panel-list">
@@ -647,6 +647,21 @@ function renderImportSummary(){
       <ul>${s.droppedNoPhotos.map(o => `<li>${escapeHtml(o.soNumber)} — ${escapeHtml(o.customer||'')}</li>`).join('')}</ul>
     </div>`;
   }
+  if(s.restored && s.restored.length){
+    html += `<div class="warn-line">↩ ${s.restored.length} order(s) were back in the backlog after being auto-archived — moved back to Open:
+      <ul>${s.restored.map(o => `<li>${escapeHtml(o.soNumber)} — ${escapeHtml(o.customer||'')}</li>`).join('')}</ul>
+    </div>`;
+  }
+  if(s.stillWaiting && s.stillWaiting.length){
+    html += `<div class="warn-line">⏳ ${s.stillWaiting.length} order(s) are missing from today's backlog but stay Open until they've been missing ${MISSING_GRACE_DAYS} days:
+      <ul>${s.stillWaiting.map(o => `<li>${escapeHtml(o.soNumber)} — ${escapeHtml(o.customer||'')} (missing ${daysMissing(o)} day${daysMissing(o)===1?'':'s'})</li>`).join('')}</ul>
+    </div>`;
+  }
+  if(s.noLines && s.noLines.length){
+    html += `<div class="warn-line">⚠ ${s.noLines.length} order(s) are in the Sales Order backlog but had <u>no line items</u> in the Line Item backlog — check the two saved searches use the same criteria:
+      <ul>${s.noLines.map(o => `<li>${escapeHtml(o.soNumber)} — ${escapeHtml(o.customer||'')}</li>`).join('')}</ul>
+    </div>`;
+  }
   html += '</div>';
   el.innerHTML = html;
   document.getElementById('dismissSummary').addEventListener('click', () => {
@@ -674,6 +689,27 @@ function toDisplayDate(iso){
   return parts[1] + '/' + parts[2] + '/' + parts[0];
 }
 
+/* Days an order may be missing from the backlog before it's treated as shipped. */
+const MISSING_GRACE_DAYS = 7;
+
+/* Combine stored and incoming line items without ever losing one.
+   Incoming lines update quantities; stored lines that didn't come through stay. */
+function mergeItems(prevItems, newItems){
+  const out = [];
+  const seen = new Set();
+  (newItems || []).forEach(it => { out.push(it); seen.add(String(it.name).trim().toLowerCase()); });
+  (prevItems || []).forEach(it => {
+    const k = String(it.name).trim().toLowerCase();
+    if(!seen.has(k)){ out.push(it); seen.add(k); }
+  });
+  return out;
+}
+
+function daysMissing(o){
+  if(!o.missingSince) return 0;
+  return Math.floor((Date.now() - new Date(o.missingSince).getTime()) / 86400000);
+}
+
 async function handleBacklogFile(e){
   const file = e.target.files[0];
   if(!file) return;
@@ -697,7 +733,7 @@ async function handleBacklogFile(e){
         soNumber: so,
         customer: String(r['Customer'] || ''),
         poNumber: String(r['PO/Check Number'] || ''),
-        orderDate: fmtDate(r['Order Date']),
+        orderDate: fmtDate(r['Order Date'] || r['Date']),
         estShipDate: fmtDate(r['Ship Date']),
         items: []
       };
@@ -737,34 +773,65 @@ async function handleBacklogFile(e){
     // Build the full list of writes, then commit in batches of <=450.
     const writes = [];
 
-    // Orders no longer in the new backlog: archive them.
+    // Orders missing from the new backlog. They stay Open until they have been
+    // missing for MISSING_GRACE_DAYS in a row; only then are they archived.
+    const nowMs = Date.now();
+    const graceMs = MISSING_GRACE_DAYS * 86400000;
+    const stillWaiting = [];
     for(const so in prevBySo){
       const prev = prevBySo[so];
       if(newSoSet.has(so)) continue;
-      if(prev.archived) continue; // already archived, leave as-is
+      const isAuto = String(prev.archivedReason || '').startsWith('auto');
+      if(prev.archived && !isAuto) continue; // archived by hand — leave it
+
+      const missingSince = prev.missingSince || (prev.archived ? prev.archivedAt : null) || new Date(nowMs).toISOString();
+      const missingMs = nowMs - new Date(missingSince).getTime();
+
+      if(missingMs < graceMs){
+        // Inside the grace window: keep (or put back) in Open and start/continue the clock.
+        writes.push({ ref: db.collection('orders').doc(so),
+          data: { missingSince, inBacklog: true, archived: false, archivedAt: null, archivedReason: null } });
+        stillWaiting.push(Object.assign({}, prev, { missingSince }));
+        continue;
+      }
+      if(prev.archived) continue; // already archived after a full grace period
+
       const hasPhotos = !!prev.hasPhotos;
       writes.push({
         ref: db.collection('orders').doc(so),
         data: {
           archived: true,
-          archivedAt: new Date().toISOString(),
-          archivedReason: hasPhotos ? 'auto — no longer in imported backlog (assumed shipped)' : 'auto — no longer in imported backlog, no photos logged yet',
-          inBacklog: false
+          archivedAt: new Date(nowMs).toISOString(),
+          archivedReason: hasPhotos ? 'auto — off the backlog ' + MISSING_GRACE_DAYS + '+ days (assumed shipped)' : 'auto — off the backlog ' + MISSING_GRACE_DAYS + '+ days, no photos logged yet',
+          inBacklog: false,
+          missingSince
         }
       });
       if(hasPhotos){ autoArchivedCount++; } else { droppedNoPhotos.push(prev); }
     }
 
     // Orders in the new backlog: upsert.
+    const restored = [];
+    const noLines = [];
     for(const o of parsedOrders){
       const prev = prevBySo[o.soNumber];
+      // An order that was auto-archived for dropping off the backlog but is back
+      // in it now was never shipped. Put it back in Open. Manual archives stand.
+      const wasAutoArchived = !!(prev && prev.archived && String(prev.archivedReason || '').startsWith('auto'));
+      if(wasAutoArchived) restored.push(o);
+      const keepArchived = prev ? (!!prev.archived && !wasAutoArchived) : false;
+      // If no line items came through for this order, keep the last good lines
+      // instead of wiping them, and flag it in the import summary.
+      if(o.items.length === 0) noLines.push(o);
+      o.items = mergeItems(prev && prev.items, o.items);
       writes.push({
         ref: db.collection('orders').doc(o.soNumber),
         data: Object.assign({}, o, {
           inBacklog: true,
-          archived: prev ? !!prev.archived : false,
-          archivedAt: prev ? (prev.archivedAt || null) : null,
-          archivedReason: prev ? (prev.archivedReason || null) : null,
+          missingSince: null,
+          archived: keepArchived,
+          archivedAt: keepArchived ? (prev.archivedAt || null) : null,
+          archivedReason: keepArchived ? (prev.archivedReason || null) : null,
           hasPhotos: prev ? !!prev.hasPhotos : false,
           entryCount: prev ? (prev.entryCount || 0) : 0
         })
@@ -782,7 +849,7 @@ async function handleBacklogFile(e){
     await db.collection('meta').doc('backlog').set({ updatedAt: backlogUpdatedAt }, { merge: true });
     renderUpdatedNote();
 
-    lastImportSummary = { total: parsedOrders.length, newCount: newlyAddedCount, autoArchivedCount, droppedNoPhotos };
+    lastImportSummary = { total: parsedOrders.length, newCount: newlyAddedCount, autoArchivedCount, droppedNoPhotos, restored, noLines, stillWaiting };
     switchTab('open');
     renderImportSummary();
   }catch(err){
@@ -863,6 +930,7 @@ function applyFilter(){
 function statusOf(o){
   if(o.archived && o.hasPhotos) return { label:'Complete', color:'#5d5d60' };
   if(o.archived) return { label:'No photo on file', color:'#BB1219' };
+  if(o.missingSince) return { label:'Off backlog ' + daysMissing(o) + 'd', color:'#B26A00' };
   if(o.hasPhotos) return { label:'Photos logged', color:'#416180' };
   return { label:'Awaiting photos', color:'#EE1C24' };
 }
@@ -1084,7 +1152,8 @@ function renderDetail(loading){
 
     '<div class="card bp"><i class="tl"></i><i class="tr"></i><i class="bl"></i><i class="br"></i>' +
       '<h2 class="section-label">Items on this order</h2>' +
-      '<div class="items-table-wrap"><table class="items-table"><tbody>' + itemsRows + '</tbody></table></div>' +
+      (items.length ? '<div class="items-table-wrap"><table class="items-table"><tbody>' + itemsRows + '</tbody></table></div>'
+                    : '<div class="hint">No line items came through from the NetSuite backlog for this order. Check it in NetSuite.</div>') +
     '</div>' +
 
     '<div class="card bp"><i class="tl"></i><i class="tr"></i><i class="bl"></i><i class="br"></i>' +
